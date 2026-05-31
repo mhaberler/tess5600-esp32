@@ -64,6 +64,52 @@ void onDataNotify(BLERemoteCharacteristic*, uint8_t* data, size_t len, bool) {
     Serial.printf("Pmax:         %.1f Pa\n", Pmax / 10.0f);
 }
 
+static void readStringChar(BLERemoteService* svc, const char* uuid, const char* label) {
+  BLERemoteCharacteristic* c = svc->getCharacteristic(BLEUUID(uuid));
+  if (c && c->canRead())
+    Serial.printf("  %-30s %s\n", label, c->readValue().c_str());
+}
+
+static void readAppearance(BLERemoteService* svc) {
+  BLERemoteCharacteristic* c = svc->getCharacteristic(BLEUUID((uint16_t)0x2a01));
+  if (!c || !c->canRead()) return;
+  String raw = c->readValue();
+  if (raw.length() < 2) return;
+  uint16_t v = (uint8_t)raw[0] | ((uint8_t)raw[1] << 8);
+  Serial.printf("  %-30s 0x%04X\n", "Appearance", v);
+}
+
+static void readConnParams(BLERemoteService* svc) {
+  BLERemoteCharacteristic* c = svc->getCharacteristic(BLEUUID((uint16_t)0x2a04));
+  if (!c || !c->canRead()) return;
+  String raw = c->readValue();
+  if (raw.length() < 8) return;
+  auto u16 = [&](int i) { return (uint16_t)((uint8_t)raw[i] | ((uint8_t)raw[i+1] << 8)); };
+  Serial.printf("  %-30s min=%.1fms max=%.1fms latency=%u timeout=%ums\n",
+    "Conn Params",
+    u16(0) * 1.25f, u16(2) * 1.25f, u16(4), (unsigned)u16(6) * 10);
+}
+
+static void readGAP(BLEClient* client) {
+  BLERemoteService* svc = client->getService(BLEUUID((uint16_t)0x1800));
+  if (!svc) { Serial.println("[GAP] service not found"); return; }
+  Serial.println("[Generic Access 0x1800]");
+  readStringChar(svc, "00002a00-0000-1000-8000-00805f9b34fb", "Device Name (0x2A00)");
+  readAppearance(svc);
+  readConnParams(svc);
+}
+
+static void readDeviceInfo(BLEClient* client) {
+  BLERemoteService* svc = client->getService(BLEUUID((uint16_t)0x180a));
+  if (!svc) { Serial.println("[DevInfo] service not found"); return; }
+  Serial.println("[Device Information 0x180A]");
+  readStringChar(svc, "00002a29-0000-1000-8000-00805f9b34fb", "Manufacturer (0x2A29)");
+  readStringChar(svc, "00002a24-0000-1000-8000-00805f9b34fb", "Model Number (0x2A24)");
+  readStringChar(svc, "00002a27-0000-1000-8000-00805f9b34fb", "Hardware Rev (0x2A27)");
+  readStringChar(svc, "00002a26-0000-1000-8000-00805f9b34fb", "Firmware Rev (0x2A26)");
+  readStringChar(svc, "00002a28-0000-1000-8000-00805f9b34fb", "Software Rev (0x2A28)");
+}
+
 void connectToSensor() {
   BLEClient* client = BLEDevice::createClient();
   if (!client->connect(myDevice)) {
@@ -71,6 +117,9 @@ void connectToSensor() {
     return;
   }
   Serial.printf("Connected: %s\n", myDevice->getAddress().toString().c_str());
+
+  readGAP(client);
+  readDeviceInfo(client);
 
   BLERemoteService* svc = client->getService(BLEUUID(SERVICE_UUID));
   if (!svc) {
