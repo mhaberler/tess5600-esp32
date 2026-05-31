@@ -19,10 +19,13 @@ static BLEAdvertisedDevice* myDevice = nullptr;
 static bool doConnect = false;
 static bool connected = false;
 
-// Scan for device advertising BASE_UUID in the complete 128-bit service UUID list
+// Active scan required: 128-bit service UUID is in the scan response, not the primary advert.
+// Match on BASE_UUID; fall back to device name if scan response hasn't arrived yet.
 class ScanCallbacks : public BLEAdvertisedDeviceCallbacks {
   void onResult(BLEAdvertisedDevice dev) {
-    if (dev.haveServiceUUID() && dev.isAdvertisingService(BLEUUID(BASE_UUID))) {
+    bool match = (dev.haveServiceUUID() && dev.isAdvertisingService(BLEUUID(BASE_UUID)))
+              || (dev.haveName() && dev.getName() == DEVICE_NAME);
+    if (match) {
       Serial.printf("Found %s: %s\n", DEVICE_NAME, dev.getAddress().toString().c_str());
       myDevice = new BLEAdvertisedDevice(dev);
       doConnect = true;
@@ -111,7 +114,7 @@ void setup() {
   BLEDevice::init("");
   BLEScan* scan = BLEDevice::getScan();
   scan->setAdvertisedDeviceCallbacks(new ScanCallbacks());
-  scan->setActiveScan(false);
+  scan->setActiveScan(true);  // required: 128-bit UUID is in scan response, not primary advert
   scan->start(60, false);
 }
 
