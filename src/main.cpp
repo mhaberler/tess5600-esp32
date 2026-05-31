@@ -13,6 +13,7 @@
 //   POLL_INTERVAL_MS   — poll interval in ms (default 10000). Only used with POLL_MODE.
 
 #define POLL_MODE 1
+#define SCAN_SECONDS 30
 
 #ifndef POLL_INTERVAL_MS
 #define POLL_INTERVAL_MS 10000
@@ -212,21 +213,27 @@ static bool connectSensor(Sensor& s) {
     auto* dataC = svc->getCharacteristic(BLEUUID(DATA_CHAR));
     if (!dataC) { logf(tag, "data char not found"); s.client->disconnect(); return false; }
 
+#ifdef POLL_MODE
+    // Poll mode: read once, decode, then caller disconnects
+    if (dataC->canRead()) {
+      String raw = dataC->readValue();
+      decodeData(tag, (uint8_t*)raw.c_str(), raw.length());
+    } else {
+      logf(tag, "data char not readable");
+    }
+#else
+    // Persistent mode: subscribe to notifications
     if (dataC->canNotify()) {
       dataC->registerForNotify([tag = String(s.tag)](BLERemoteCharacteristic*, uint8_t* d, size_t len, bool) {
         decodeData(tag.c_str(), d, len);
       });
       logf(tag, "subscribed to data notifications");
-    } else if (dataC->canRead()) {
-#ifdef POLL_MODE
-      String raw = dataC->readValue();
-      decodeData(tag, (uint8_t*)raw.c_str(), raw.length());
-#else
+    } else {
       logf(tag, "data char has no notify — cannot use persistent mode");
       s.client->disconnect();
       return false;
-#endif
     }
+#endif
   }
 
   s.active = true;
@@ -248,9 +255,14 @@ static void scheduleReconnect(Sensor& s) {
 class ScanCallbacks : public BLEAdvertisedDeviceCallbacks {
   void onResult(BLEAdvertisedDevice dev) {
     if (sensorCount >= MAX_SENSORS) return;
-    bool match = (dev.haveServiceUUID() && dev.isAdvertisingService(BLEUUID(BASE_UUID)))
-              || (dev.haveName() && dev.getName() == DEVICE_NAME);
-    if (!match) return;
+
+    bool hasBaseUUID = dev.haveServiceUUID() && dev.isAdvertisingService(BLEUUID(BASE_UUID));
+    bool hasName     = dev.haveName() && dev.getName() == DEVICE_NAME;
+
+    // Require name match always. UUID alone is too broad (other devices use the TI base UUID).
+    // Accept UUID+name (active scan, scan response received) or name-only (scan response not yet in).
+    if (!hasName) return;
+    if (dev.haveServiceUUID() && !hasBaseUUID) return;  // has UUIDs but wrong ones — reject
 
     // Deduplicate
     String addr = dev.getAddress().toString();
@@ -279,7 +291,7 @@ void setup() {
   BLEScan* scan = BLEDevice::getScan();
   scan->setAdvertisedDeviceCallbacks(new ScanCallbacks(), false);
   scan->setActiveScan(true);  // 128-bit UUID in scan response — active scan required
-  scan->start(10, [](BLEScanResults) {
+  scan->start(SCAN_SECONDS, [](BLEScanResults) {
     Serial.printf("Scan complete: %d sensor(s) found\n", sensorCount);
     scanDone = true;
   }, false);
@@ -289,15 +301,28 @@ void loop() {
   if (!scanDone) return;
 
 #ifdef POLL_MODE
+  // One sensor per loop() call, round-robin. Only one BLE connection active at a time.
+  static int pollIdx = 0;
+  if (sensorCount == 0) { delay(100); return; }
+
+  Sensor& s = sensors[pollIdx];
   uint32_t now = millis();
-  for (int i = 0; i < sensorCount; i++) {
-    Sensor& s = sensors[i];
-    if (now < s.pollAt) continue;
+
+  if (now >= s.pollAt) {
     s.pollAt = now + POLL_INTERVAL_MS;
-    if (s.client && s.client->isConnected()) s.client->disconnect();
+    if (s.client && s.client->isConnected()) {
+      s.client->disconnect();
+      delay(200);  // let NimBLE release the connection before opening the next
+    }
     connectSensor(s);
-    if (s.client && s.client->isConnected()) s.client->disconnect();
+    if (s.client && s.client->isConnected()) {
+      s.client->disconnect();
+      delay(200);
+    }
   }
+
+  pollIdx = (pollIdx + 1) % sensorCount;
+  delay(50);
 #else
   uint32_t now = millis();
   for (int i = 0; i < sensorCount; i++) {
