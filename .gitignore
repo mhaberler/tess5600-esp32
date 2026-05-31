@@ -1,2 +1,8 @@
 .pio
 .vscode/
+.cc-history/
+firmware/
+managed_components
+.dummy
+src/idf_component.yml
+compile_commands.json
