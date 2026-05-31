@@ -14,6 +14,7 @@
 
 #define POLL_MODE 1
 #define SCAN_SECONDS 30
+#define DUMP_RAW_DATA   // print raw hex of F000AB31 payload alongside decoded values
 
 #ifndef POLL_INTERVAL_MS
 #define POLL_INTERVAL_MS 10000
@@ -30,7 +31,7 @@ static const char* BATTERY_CHAR    = "f0002a19-0451-4000-b000-000000000000";
 
 static const char* DEVICE_NAME     = "TESS 5600";
 
-static const int   MAX_SENSORS     = 4;
+static const int   MAX_SENSORS     = 16;
 static const int   RECONNECT_BASE_MS = 2000;
 static const int   RECONNECT_MAX_MS  = 30000;
 
@@ -95,25 +96,49 @@ static void logf(const char* tag, const char* fmt, ...) {
 static void decodeData(const char* tag, uint8_t* d, size_t len) {
   if (len < 14) { logf(tag, "data: short packet (%u bytes)", len); return; }
 
-  int16_t T    = (int16_t)((d[1] << 8) | d[0]);
-  int32_t P    = (int32_t)((d[5]<<24)|(d[4]<<16)|(d[3]<<8)|d[2]);
-  int32_t Pmin = (int32_t)((d[9]<<24)|(d[8]<<16)|(d[7]<<8)|d[6]);
-  int32_t Pmax = (int32_t)((d[13]<<24)|(d[12]<<16)|(d[11]<<8)|d[10]);
+#ifdef DUMP_RAW_DATA
+  Serial.printf("[%s] raw(%u):", tag, len);
+  for (size_t i = 0; i < len; i++) Serial.printf(" %02X", d[i]);
+  Serial.println();
+#endif
 
-  if (T == 0x7FFF)
-    logf(tag, "temperature: ERROR");
+  // Layout: T[0-1] P[2-5] Pmin[6-9] Pmax[10-13], all little-endian signed
+  int16_t T    = (int16_t)((d[1] << 8) | d[0]);
+  int32_t P    = (int32_t)(d[2] | (d[3]<<8) | (d[4]<<16) | (d[5]<<24));
+  int32_t Pmin = (int32_t)(d[6] | (d[7]<<8) | (d[8]<<16) | (d[9]<<24));
+  int32_t Pmax = (int32_t)(d[10] | (d[11]<<8) | (d[12]<<16) | (d[13]<<24));
+
+  // Error sentinels: device sends 0xFFFF (T) and 0xFFFFFFFF (P) — not 0x7FFF/0x7FFFFFFF as spec states
+  if ((uint16_t)T == 0xFFFF || T == 0x7FFF)
+    logf(tag, "temperature: NO DATA");
   else
     logf(tag, "temperature: %.2f °C", T / 100.0f);
 
-  if (P == (int32_t)0x7FFFFFFF)
-    logf(tag, "pressure: ERROR");
-  else
-    logf(tag, "pressure: %.1f Pa  /  %.4f psi", P / 10.0f, P / 10.0f / 6894.7f);
+  auto isErrP = [](int32_t v){ return (uint32_t)v == 0xFFFFFFFF || v == (int32_t)0x7FFFFFFF; };
 
-  if (Pmin != (int32_t)0x7FFFFFFF)
-    logf(tag, "Pmin: %.1f Pa", Pmin / 10.0f);
-  if (Pmax != (int32_t)0x7FFFFFFF)
-    logf(tag, "Pmax: %.1f Pa", Pmax / 10.0f);
+  // P/10 = Pa  (confirmed from observed values ~800 kPa = ~8 bar = plausible)
+  auto paToPsi = [](float pa){ return pa / 6894.757f; };
+  auto paToBar = [](float pa){ return pa / 100000.0f; };
+
+  if (isErrP(P)) {
+    logf(tag, "pressure: NO DATA");
+  } else {
+    float pa = P / 10.0f;
+#ifdef DUMP_RAW_DATA
+    logf(tag, "pressure: %.1f Pa  =  %.4f bar  =  %.4f psi", pa, paToBar(pa), paToPsi(pa));
+#else
+    logf(tag, "pressure: %.4f bar  (%.1f Pa  /  %.4f psi)", paToBar(pa), pa, paToPsi(pa));
+#endif
+  }
+
+  if (!isErrP(Pmin)) {
+    float pa = Pmin / 10.0f;
+    logf(tag, "Pmin: %.4f bar  (%.1f Pa)", paToBar(pa), pa);
+  }
+  if (!isErrP(Pmax)) {
+    float pa = Pmax / 10.0f;
+    logf(tag, "Pmax: %.4f bar  (%.1f Pa)", paToBar(pa), pa);
+  }
 }
 
 // ── Per-sensor connect ────────────────────────────────────────────────────────
@@ -179,6 +204,15 @@ static void readStaticInfo(Sensor& s, BLEClient* client) {
 static bool connectSensor(Sensor& s) {
   const char* tag = s.tag;
 
+#ifdef POLL_MODE
+  // Always destroy and recreate — reusing a BLEClient across polls causes "Client busy" errors
+  // because NimBLE may not release the handle before the next connect() call.
+  if (s.client) {
+    if (s.client->isConnected()) s.client->disconnect();
+    delete s.client;
+    s.client = nullptr;
+  }
+#endif
   if (!s.client) s.client = BLEDevice::createClient();
   if (!s.client->connect(s.addr)) {
     logf(tag, "connection failed");
@@ -251,7 +285,13 @@ static bool connectSensor(Sensor& s) {
     if (!dataC) { logf(tag, "data char not found"); s.client->disconnect(); return false; }
 
 #ifdef POLL_MODE
-    // Poll mode: read once, decode, then caller disconnects
+    // Poll mode: wait one sensor update cycle before reading — sensor returns 0xFF if read too early.
+    // Use the data rate from the descriptor (default 5000ms if not yet read).
+    {
+      uint32_t waitMs = s.info.dataRateMs > 0 ? s.info.dataRateMs : 5000;
+      logf(tag, "waiting %ums for sensor update...", waitMs);
+      delay(waitMs);
+    }
     if (dataC->canRead()) {
       String raw = dataC->readValue();
       decodeData(tag, (uint8_t*)raw.c_str(), raw.length());
@@ -346,16 +386,13 @@ void loop() {
   uint32_t now = millis();
 
   if (now >= s.pollAt) {
-    s.pollAt = now + POLL_INTERVAL_MS;
-    if (s.client && s.client->isConnected()) {
-      s.client->disconnect();
-      delay(200);  // let NimBLE release the connection before opening the next
-    }
     connectSensor(s);
     if (s.client && s.client->isConnected()) {
       s.client->disconnect();
       delay(200);
     }
+    // Set next poll time AFTER the full connect+read+disconnect cycle completes.
+    s.pollAt = millis() + POLL_INTERVAL_MS;
   }
 
   pollIdx = (pollIdx + 1) % sensorCount;
