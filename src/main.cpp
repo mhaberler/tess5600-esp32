@@ -34,13 +34,26 @@ static const int   MAX_SENSORS     = 4;
 static const int   RECONNECT_BASE_MS = 2000;
 static const int   RECONNECT_MAX_MS  = 30000;
 
-// ── Sensor record ────────────────────────────────────────────────────────────
+// ── Sensor registry ───────────────────────────────────────────────────────────
+
+struct SensorInfo {
+  String   mac;
+  String   deviceName, manufacturer, model, hwRev, fwRev, swRev;
+  uint16_t appearance   = 0;
+  float    connMinMs    = 0, connMaxMs = 0;
+  uint16_t connLatency  = 0, connTimeoutMs = 0;
+  uint32_t dataRateMs   = 0, dataRateMinMs = 0, dataRateMaxMs = 0;
+};
+
+// ── Sensor record ─────────────────────────────────────────────────────────────
 
 struct Sensor {
   BLEAddress   addr;
   char         tag[9];    // "XX:XX:XX\0" — last 3 octets
   BLEClient*   client    = nullptr;
   bool         active    = false;
+  bool         infoRead  = false;
+  SensorInfo   info;
   uint32_t     reconnectAt = 0;
   int          reconnectDelay = RECONNECT_BASE_MS;
 #ifdef POLL_MODE
@@ -105,46 +118,62 @@ static void decodeData(const char* tag, uint8_t* d, size_t len) {
 
 // ── Per-sensor connect ────────────────────────────────────────────────────────
 
-static void readStringChar(BLERemoteService* svc, const char* uuid,
-                           const char* tag, const char* label) {
+static String readStrChar(BLERemoteService* svc, const char* uuid) {
   auto* c = svc->getCharacteristic(BLEUUID(uuid));
-  if (c && c->canRead())
-    logf(tag, "%s: %s", label, c->readValue().c_str());
+  return (c && c->canRead()) ? c->readValue() : String();
 }
 
-static void readGAP(BLEClient* client, const char* tag) {
-  auto* svc = client->getService(BLEUUID((uint16_t)0x1800));
-  if (!svc) return;
-  logf(tag, "--- Generic Access ---");
-  readStringChar(svc, "00002a00-0000-1000-8000-00805f9b34fb", tag, "name");
-  // Appearance
-  auto* c = svc->getCharacteristic(BLEUUID((uint16_t)0x2a01));
-  if (c && c->canRead()) {
-    String raw = c->readValue();
-    if (raw.length() >= 2)
-      logf(tag, "appearance: 0x%04X", (uint8_t)raw[0] | ((uint8_t)raw[1] << 8));
-  }
-  // Conn params
-  c = svc->getCharacteristic(BLEUUID((uint16_t)0x2a04));
-  if (c && c->canRead()) {
-    String raw = c->readValue();
-    if (raw.length() >= 8) {
-      auto u16 = [&](int i){ return (uint16_t)((uint8_t)raw[i]|((uint8_t)raw[i+1]<<8)); };
-      logf(tag, "conn params: min=%.1fms max=%.1fms latency=%u timeout=%ums",
-           u16(0)*1.25f, u16(2)*1.25f, u16(4), (unsigned)u16(6)*10);
+static void readStaticInfo(Sensor& s, BLEClient* client) {
+  const char* tag = s.tag;
+  SensorInfo& info = s.info;
+
+  info.mac = s.addr.toString().c_str();
+
+  // Generic Access (0x1800)
+  auto* gap = client->getService(BLEUUID((uint16_t)0x1800));
+  if (gap) {
+    info.deviceName = readStrChar(gap, "00002a00-0000-1000-8000-00805f9b34fb");
+    auto* c = gap->getCharacteristic(BLEUUID((uint16_t)0x2a01));
+    if (c && c->canRead()) {
+      String raw = c->readValue();
+      if (raw.length() >= 2)
+        info.appearance = (uint8_t)raw[0] | ((uint8_t)raw[1] << 8);
+    }
+    c = gap->getCharacteristic(BLEUUID((uint16_t)0x2a04));
+    if (c && c->canRead()) {
+      String raw = c->readValue();
+      if (raw.length() >= 8) {
+        auto u16 = [&](int i){ return (uint16_t)((uint8_t)raw[i]|((uint8_t)raw[i+1]<<8)); };
+        info.connMinMs     = u16(0) * 1.25f;
+        info.connMaxMs     = u16(2) * 1.25f;
+        info.connLatency   = u16(4);
+        info.connTimeoutMs = u16(6) * 10;
+      }
     }
   }
-}
 
-static void readDeviceInfo(BLEClient* client, const char* tag) {
-  auto* svc = client->getService(BLEUUID((uint16_t)0x180a));
-  if (!svc) return;
-  logf(tag, "--- Device Information ---");
-  readStringChar(svc, "00002a29-0000-1000-8000-00805f9b34fb", tag, "manufacturer");
-  readStringChar(svc, "00002a24-0000-1000-8000-00805f9b34fb", tag, "model");
-  readStringChar(svc, "00002a27-0000-1000-8000-00805f9b34fb", tag, "hw rev");
-  readStringChar(svc, "00002a26-0000-1000-8000-00805f9b34fb", tag, "fw rev");
-  readStringChar(svc, "00002a28-0000-1000-8000-00805f9b34fb", tag, "sw rev");
+  // Device Information (0x180A)
+  auto* di = client->getService(BLEUUID((uint16_t)0x180a));
+  if (di) {
+    info.manufacturer = readStrChar(di, "00002a29-0000-1000-8000-00805f9b34fb");
+    info.model        = readStrChar(di, "00002a24-0000-1000-8000-00805f9b34fb");
+    info.hwRev        = readStrChar(di, "00002a27-0000-1000-8000-00805f9b34fb");
+    info.fwRev        = readStrChar(di, "00002a26-0000-1000-8000-00805f9b34fb");
+    info.swRev        = readStrChar(di, "00002a28-0000-1000-8000-00805f9b34fb");
+  }
+
+  // Print once
+  logf(tag, "--- Device descriptor ---");
+  logf(tag, "mac:          %s",     info.mac.c_str());
+  logf(tag, "name:         %s",     info.deviceName.c_str());
+  logf(tag, "appearance:   0x%04X", info.appearance);
+  logf(tag, "conn params:  min=%.1fms max=%.1fms latency=%u timeout=%ums",
+       info.connMinMs, info.connMaxMs, info.connLatency, info.connTimeoutMs);
+  logf(tag, "manufacturer: %s",     info.manufacturer.c_str());
+  logf(tag, "model:        %s",     info.model.c_str());
+  logf(tag, "hw rev:       %s",     info.hwRev.c_str());
+  logf(tag, "fw rev:       %s",     info.fwRev.c_str());
+  logf(tag, "sw rev:       %s",     info.swRev.c_str());
 }
 
 static bool connectSensor(Sensor& s) {
@@ -157,8 +186,10 @@ static bool connectSensor(Sensor& s) {
   }
   logf(tag, "connected");
 
-  readGAP(s.client, tag);
-  readDeviceInfo(s.client, tag);
+  if (!s.infoRead) {
+    readStaticInfo(s, s.client);
+    s.infoRead = true;
+  }
 
   // ── Battery ──────────────────────────────────────────────────────────────
   {
@@ -193,19 +224,25 @@ static bool connectSensor(Sensor& s) {
       logf(tag, "sensor status: %s (0x%02X)", st == 0 ? "OK" : "ERROR", st);
     }
 
-    // Data rate (f000ab32) — 3x uint32_t LE: current_ms, min_ms, max_ms
-    auto* rateC = svc->getCharacteristic(BLEUUID(DATARATE_CHAR));
-    if (rateC && rateC->canRead()) {
-      String raw = rateC->readValue();
-      if (raw.length() >= 12) {
-        auto u32 = [&](int i) -> uint32_t {
-          return (uint8_t)raw[i] | ((uint8_t)raw[i+1]<<8) | ((uint8_t)raw[i+2]<<16) | ((uint8_t)raw[i+3]<<24);
-        };
-        logf(tag, "data rate: %ums  (min %ums  max %ums)", u32(0), u32(4), u32(8));
-      } else {
-        Serial.printf("[%s] data rate raw (%u bytes):", tag, raw.length());
-        for (size_t i = 0; i < raw.length(); i++) Serial.printf(" %02X", (uint8_t)raw[i]);
-        Serial.println();
+    // Data rate (f000ab32) — read once: 3x uint32_t LE: current_ms, min_ms, max_ms
+    if (!s.infoRead) {
+      auto* rateC = svc->getCharacteristic(BLEUUID(DATARATE_CHAR));
+      if (rateC && rateC->canRead()) {
+        String raw = rateC->readValue();
+        if (raw.length() >= 12) {
+          auto u32 = [&](int i) -> uint32_t {
+            return (uint8_t)raw[i] | ((uint8_t)raw[i+1]<<8) | ((uint8_t)raw[i+2]<<16) | ((uint8_t)raw[i+3]<<24);
+          };
+          s.info.dataRateMs    = u32(0);
+          s.info.dataRateMinMs = u32(4);
+          s.info.dataRateMaxMs = u32(8);
+          logf(tag, "data rate: %ums  (min %ums  max %ums)",
+               s.info.dataRateMs, s.info.dataRateMinMs, s.info.dataRateMaxMs);
+        } else {
+          Serial.printf("[%s] data rate raw (%u bytes):", tag, raw.length());
+          for (size_t i = 0; i < raw.length(); i++) Serial.printf(" %02X", (uint8_t)raw[i]);
+          Serial.println();
+        }
       }
     }
 
